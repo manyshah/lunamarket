@@ -4,7 +4,6 @@ on:
   push:
     branches:
       - main
-
   workflow_dispatch:
 
 permissions:
@@ -25,6 +24,38 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
 
+      - name: Verify repository structure
+        shell: bash
+        run: |
+          set -euo pipefail
+          required=(
+            "package.json"
+            "index.html"
+            "vite.config.ts"
+            "tsconfig.app.json"
+            "src/main.tsx"
+            "src/App.tsx"
+            "src/styles.css"
+            "src/vite-env.d.ts"
+            "public/luna-logo.webp"
+          )
+
+          missing=0
+          for file in "${required[@]}"; do
+            if [[ ! -f "$file" ]]; then
+              echo "::error file=$file::Required project file is missing: $file"
+              missing=1
+            fi
+          done
+
+          if [[ "$missing" -ne 0 ]]; then
+            echo "Repository upload is incomplete. Upload the src and public folders as well as the root files."
+            exit 1
+          fi
+
+          echo "Repository structure OK"
+          find src -maxdepth 2 -type f | sort
+
       - name: Setup Node.js
         uses: actions/setup-node@v7
         with:
@@ -32,10 +63,19 @@ jobs:
           package-manager-cache: false
 
       - name: Install dependencies
-        run: npm install
+        run: npm install --no-audit --no-fund
 
-      - name: Build production site
+      - name: Type-check and build production site
         run: npm run build
+
+      - name: Verify production output
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f dist/index.html
+          test -f dist/luna-logo.webp
+          echo "Production output OK"
+          find dist -maxdepth 2 -type f | sort
 
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
