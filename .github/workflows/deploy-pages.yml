@@ -1,100 +1,535 @@
-name: Deploy Luna Market to GitHub Pages
+name: Luna Market - ZIP Auto Build & Deploy
 
 on:
   push:
     branches:
       - main
+    paths:
+      - "*.zip"
+      - ".github/workflows/deploy-pages.yml"
+
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   pages: write
   id-token: write
 
 concurrency:
-  group: "pages"
+  group: "luna-market-pages"
   cancel-in-progress: true
 
 jobs:
   build:
-    name: Build Luna Market
+    name: Find ZIP, Extract & Build
     runs-on: ubuntu-latest
 
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
+    outputs:
+      selected_zip: ${{ steps.select_zip.outputs.selected_zip }}
 
-      - name: Verify repository structure
+    steps:
+      # -------------------------------------------------------
+      # Checkout repository
+      # fetch-depth: 0 is required so we can inspect ZIP history
+      # -------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # -------------------------------------------------------
+      # Detect newest ZIP
+      #
+      # Priority:
+      # 1. ZIP uploaded/modified in the current push
+      # 2. Otherwise newest ZIP according to Git history
+      # -------------------------------------------------------
+      - name: Detect latest uploaded ZIP
+        id: select_zip
         shell: bash
         run: |
-          set -euo pipefail
-          required=(
-            "package.json"
-            "index.html"
-            "vite.config.ts"
-            "tsconfig.app.json"
-            "src/main.tsx"
-            "src/App.tsx"
-            "src/styles.css"
-            "src/vite-env.d.ts"
-            "public/luna-logo.webp"
-          )
+          set -Eeuo pipefail
 
-          missing=0
-          for file in "${required[@]}"; do
-            if [[ ! -f "$file" ]]; then
-              echo "::error file=$file::Required project file is missing: $file"
-              missing=1
+          echo "=========================================="
+          echo " Detecting latest Luna Market ZIP"
+          echo "=========================================="
+
+          SELECTED_ZIP=""
+
+          # ---------------------------------------------------
+          # For normal push:
+          # First look for ZIP added/modified in this commit
+          # ---------------------------------------------------
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "Checking ZIP files changed in current push..."
+
+            mapfile -t PUSHED_ZIPS < <(
+              git diff-tree \
+                --no-commit-id \
+                --name-only \
+                --diff-filter=AM \
+                -r "$GITHUB_SHA" \
+                -- "*.zip" "*.ZIP" \
+              | awk 'index($0, "/") == 0 && NF'
+            )
+
+            if [ "${#PUSHED_ZIPS[@]}" -gt 0 ]; then
+              echo "ZIP files found in current push:"
+
+              for zip in "${PUSHED_ZIPS[@]}"; do
+                echo "  - $zip"
+              done
+
+              # If more than one ZIP is uploaded in one commit,
+              # use the last one returned from the commit.
+              SELECTED_ZIP="${PUSHED_ZIPS[-1]}"
             fi
-          done
+          fi
 
-          if [[ "$missing" -ne 0 ]]; then
-            echo "Repository upload is incomplete. Upload the src and public folders as well as the root files."
+          # ---------------------------------------------------
+          # Manual run / workflow edit / fallback:
+          # Find latest existing ZIP by Git commit timestamp
+          # ---------------------------------------------------
+          if [ -z "$SELECTED_ZIP" ]; then
+            echo "No new ZIP detected in this push."
+            echo "Finding latest ZIP from repository history..."
+
+            BEST_TIME=0
+
+            shopt -s nullglob nocaseglob
+
+            ZIP_FILES=( *.zip )
+
+            if [ "${#ZIP_FILES[@]}" -eq 0 ]; then
+              echo "::error::No ZIP file exists in repository root."
+              echo "Upload Luna-Market-vX.X.X.zip to the repository root."
+              exit 1
+            fi
+
+            for zip in "${ZIP_FILES[@]}"; do
+              ZIP_TIME="$(git log -1 --format=%ct -- "$zip" 2>/dev/null || echo 0)"
+
+              if [ -z "$ZIP_TIME" ]; then
+                ZIP_TIME=0
+              fi
+
+              echo "$zip -> commit time: $ZIP_TIME"
+
+              if [ "$ZIP_TIME" -ge "$BEST_TIME" ]; then
+                BEST_TIME="$ZIP_TIME"
+                SELECTED_ZIP="$zip"
+              fi
+            done
+          fi
+
+          # ---------------------------------------------------
+          # Final validation
+          # ---------------------------------------------------
+          if [ -z "$SELECTED_ZIP" ]; then
+            echo "::error::Could not determine ZIP file."
             exit 1
           fi
 
-          echo "Repository structure OK"
-          find src -maxdepth 2 -type f | sort
+          if [ ! -f "$SELECTED_ZIP" ]; then
+            echo "::error::Selected ZIP does not exist: $SELECTED_ZIP"
+            exit 1
+          fi
 
+          echo ""
+          echo "=========================================="
+          echo " Selected ZIP: $SELECTED_ZIP"
+          echo "=========================================="
+
+          echo "selected_zip=$SELECTED_ZIP" >> "$GITHUB_OUTPUT"
+
+      # -------------------------------------------------------
+      # Validate ZIP archive
+      # -------------------------------------------------------
+      - name: Validate ZIP archive
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          ZIP="${{ steps.select_zip.outputs.selected_zip }}"
+
+          echo "Testing archive:"
+          echo "$ZIP"
+
+          unzip -t "$ZIP"
+
+          echo "ZIP archive is valid."
+
+      # -------------------------------------------------------
+      # Extract ZIP into isolated build directory
+      # -------------------------------------------------------
+      - name: Extract selected ZIP
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          ZIP="${{ steps.select_zip.outputs.selected_zip }}"
+
+          rm -rf "$GITHUB_WORKSPACE/_luna_source"
+          mkdir -p "$GITHUB_WORKSPACE/_luna_source"
+
+          echo "Extracting:"
+          echo "$ZIP"
+
+          unzip -q "$ZIP" -d "$GITHUB_WORKSPACE/_luna_source"
+
+          echo ""
+          echo "Extraction completed."
+
+          echo ""
+          echo "Top-level extracted files:"
+          find "$GITHUB_WORKSPACE/_luna_source" \
+            -maxdepth 2 \
+            -type f \
+            | head -100
+
+      # -------------------------------------------------------
+      # Automatically find project root
+      #
+      # Supports:
+      #
+      # ZIP:
+      #   package.json
+      #   src/
+      #
+      # OR:
+      #
+      # ZIP:
+      #   Luna-Market-v1.0/
+      #     package.json
+      #     src/
+      # -------------------------------------------------------
+      - name: Detect project root
+        id: project
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          SOURCE="$GITHUB_WORKSPACE/_luna_source"
+
+          echo "Searching for package.json..."
+
+          mapfile -t PACKAGE_FILES < <(
+            find "$SOURCE" \
+              -maxdepth 4 \
+              -type f \
+              -name "package.json" \
+              -not -path "*/node_modules/*" \
+              -not -path "*/__MACOSX/*"
+          )
+
+          if [ "${#PACKAGE_FILES[@]}" -eq 0 ]; then
+            echo "::error::package.json was not found inside ZIP."
+            exit 1
+          fi
+
+          PROJECT_ROOT=""
+
+          # Prefer package.json whose directory contains src/
+          for package_file in "${PACKAGE_FILES[@]}"; do
+            candidate="$(dirname "$package_file")"
+
+            if [ -d "$candidate/src" ]; then
+              PROJECT_ROOT="$candidate"
+              break
+            fi
+          done
+
+          # Fallback to first package.json
+          if [ -z "$PROJECT_ROOT" ]; then
+            PROJECT_ROOT="$(dirname "${PACKAGE_FILES[0]}")"
+          fi
+
+          echo ""
+          echo "=========================================="
+          echo " Project root:"
+          echo " $PROJECT_ROOT"
+          echo "=========================================="
+
+          echo "project_root=$PROJECT_ROOT" >> "$GITHUB_OUTPUT"
+
+      # -------------------------------------------------------
+      # Validate Luna Market source
+      # -------------------------------------------------------
+      - name: Validate project structure
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          ROOT="${{ steps.project.outputs.project_root }}"
+
+          echo "Validating Luna Market source..."
+
+          if [ ! -f "$ROOT/package.json" ]; then
+            echo "::error::package.json missing."
+            exit 1
+          fi
+
+          if [ ! -d "$ROOT/src" ]; then
+            echo "::error::src directory missing."
+            exit 1
+          fi
+
+          if [ ! -f "$ROOT/index.html" ]; then
+            echo "::error::index.html missing."
+            exit 1
+          fi
+
+          echo ""
+          echo "Project validation passed."
+
+      # -------------------------------------------------------
+      # Setup Node.js
+      # -------------------------------------------------------
       - name: Setup Node.js
         uses: actions/setup-node@v7
         with:
           node-version: "24"
           package-manager-cache: false
 
-      - name: Install dependencies
-        run: npm install --no-audit --no-fund
-
-      - name: Type-check and build production site
-        run: npm run build
-
-      - name: Verify production output
+      # -------------------------------------------------------
+      # Show Node/npm versions
+      # -------------------------------------------------------
+      - name: Show build environment
         shell: bash
         run: |
-          set -euo pipefail
-          test -f dist/index.html
-          test -f dist/luna-logo.webp
-          echo "Production output OK"
-          find dist -maxdepth 2 -type f | sort
+          node --version
+          npm --version
 
+      # -------------------------------------------------------
+      # Install dependencies
+      #
+      # package-lock.json => npm ci
+      # no package-lock   => npm install
+      # -------------------------------------------------------
+      - name: Install dependencies
+        shell: bash
+        working-directory: ${{ steps.project.outputs.project_root }}
+        run: |
+          set -Eeuo pipefail
+
+          if [ -f "package-lock.json" ]; then
+            echo "package-lock.json detected."
+            echo "Running npm ci..."
+
+            npm ci
+          else
+            echo "No package-lock.json detected."
+            echo "Running npm install..."
+
+            npm install
+          fi
+
+      # -------------------------------------------------------
+      # Production build
+      # -------------------------------------------------------
+      - name: Build Luna Market
+        shell: bash
+        working-directory: ${{ steps.project.outputs.project_root }}
+        run: |
+          set -Eeuo pipefail
+
+          echo "Starting production build..."
+
+          npm run build
+
+      # -------------------------------------------------------
+      # Validate dist output
+      # -------------------------------------------------------
+      - name: Validate production output
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          ROOT="${{ steps.project.outputs.project_root }}"
+
+          if [ ! -d "$ROOT/dist" ]; then
+            echo "::error::dist directory was not generated."
+            exit 1
+          fi
+
+          if [ ! -f "$ROOT/dist/index.html" ]; then
+            echo "::error::dist/index.html was not generated."
+            exit 1
+          fi
+
+          echo ""
+          echo "Production build verified."
+
+          echo ""
+          echo "Generated files:"
+          find "$ROOT/dist" -maxdepth 2 -type f | sort
+
+      # -------------------------------------------------------
+      # Prepare clean GitHub Pages directory
+      # -------------------------------------------------------
+      - name: Prepare GitHub Pages artifact
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          ROOT="${{ steps.project.outputs.project_root }}"
+
+          rm -rf "$GITHUB_WORKSPACE/pages-dist"
+
+          cp -a "$ROOT/dist" "$GITHUB_WORKSPACE/pages-dist"
+
+          touch "$GITHUB_WORKSPACE/pages-dist/.nojekyll"
+
+          echo "GitHub Pages artifact prepared."
+
+      # -------------------------------------------------------
+      # Configure GitHub Pages
+      # -------------------------------------------------------
       - name: Configure GitHub Pages
-        uses: actions/configure-pages@v5
+        uses: actions/configure-pages@v6
 
+      # -------------------------------------------------------
+      # Upload Pages artifact
+      # -------------------------------------------------------
       - name: Upload GitHub Pages artifact
-        uses: actions/upload-pages-artifact@v4
+        uses: actions/upload-pages-artifact@v5
         with:
-          path: ./dist
+          path: ./pages-dist
 
+
+  # ===========================================================
+  # DEPLOY
+  # ===========================================================
   deploy:
     name: Deploy Luna Market
+    runs-on: ubuntu-latest
+
+    needs:
+      - build
+
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
 
-    runs-on: ubuntu-latest
-    needs: build
-
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
+
+
+  # ===========================================================
+  # CLEANUP OLD ZIP FILES
+  #
+  # Runs ONLY after successful build + deployment.
+  # Keeps the ZIP that was just deployed.
+  # Deletes all other ZIPs from repository root.
+  # ===========================================================
+  cleanup:
+    name: Delete Old ZIP Files
+    runs-on: ubuntu-latest
+
+    needs:
+      - build
+      - deploy
+
+    if: ${{ needs.deploy.result == 'success' }}
+
+    steps:
+      # -------------------------------------------------------
+      # Checkout latest main branch
+      # -------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+
+      # -------------------------------------------------------
+      # Delete all ZIPs except selected one
+      # -------------------------------------------------------
+      - name: Remove old ZIP files
+        id: cleanup_zips
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          KEEP_ZIP="${{ needs.build.outputs.selected_zip }}"
+
+          echo ""
+          echo "=========================================="
+          echo " Keeping:"
+          echo " $KEEP_ZIP"
+          echo "=========================================="
+
+          shopt -s nullglob nocaseglob
+
+          FOUND_OLD=false
+
+          for zip in *.zip; do
+
+            if [ "$zip" = "$KEEP_ZIP" ]; then
+              echo "KEEP   -> $zip"
+              continue
+            fi
+
+            echo "DELETE -> $zip"
+
+            rm -f -- "$zip"
+
+            FOUND_OLD=true
+          done
+
+          if [ "$FOUND_OLD" = "true" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+
+            echo ""
+            echo "No old ZIP files found."
+          fi
+
+      # -------------------------------------------------------
+      # Commit cleanup
+      #
+      # [skip ci] prevents cleanup commit from triggering
+      # this workflow again.
+      # -------------------------------------------------------
+      - name: Commit ZIP cleanup
+        if: steps.cleanup_zips.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -A -- "*.zip" "*.ZIP" || true
+
+          if git diff --cached --quiet; then
+            echo "Nothing to commit."
+            exit 0
+          fi
+
+          git commit -m "chore: remove old Luna Market ZIP files [skip ci]"
+
+          git push origin HEAD:main
+
+          echo ""
+          echo "Old ZIP files removed successfully."
+
+      # -------------------------------------------------------
+      # Final information
+      # -------------------------------------------------------
+      - name: Finished
+        shell: bash
+        run: |
+          echo ""
+          echo "=========================================="
+          echo " Luna Market deployment completed"
+          echo "=========================================="
+          echo ""
+          echo "Current ZIP:"
+          echo "${{ needs.build.outputs.selected_zip }}"
+          echo ""
+          echo "Site:"
+          echo "https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/"
